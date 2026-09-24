@@ -1622,26 +1622,319 @@ def inject_css() -> None:
     )
 
 
+
+def clean_display_df(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    for c in out.columns:
+        out[c] = out[c].map(lambda v: "Not available" if is_missing(v) else v)
+    return out
+
+
+def metric_card(label: str, value: str, delta: str = "", signal: str = "", tone: str = "blue", help_text: str = "") -> None:
+    tone_cls = {"blue":"card-blue", "teal":"card-teal", "purple":"card-purple", "orange":"card-orange", "red":"card-red", "green":"card-green"}.get(tone, "card-blue")
+    title = f' title="{help_text.replace(chr(34), "&quot;")}"' if help_text else ""
+    delta_html = f"<div class='metric-delta'>{delta}</div>" if delta else ""
+    st.markdown(
+        f"<div class='metric-card {tone_cls}'{title}><div class='metric-label'>{signal} {label}</div><div class='metric-value'>{value}</div>{delta_html}</div>",
+        unsafe_allow_html=True,
+    )
+
+
+def portfolio_survival_df(model: Dict[str, Any], include_directional: bool = False) -> pd.DataFrame:
+    curves=[]
+    for code in model['program_order']:
+        p=model['programs'][code]
+        n=safe_num(p.get('mature_n'))
+        if np.isnan(n) or n<=0 or (n<THRESHOLDS['thin_sample_n'] and not include_directional):
+            continue
+        cdf=survival_curve(model, code)
+        if not cdf.empty:
+            curves.append(cdf[['Term','N']].copy())
+    if not curves:
+        return pd.DataFrame(columns=['Term','N','Survival'])
+    allc=pd.concat(curves, ignore_index=True)
+    denom=sum(float(c['N'].iloc[0]) for c in curves if len(c))
+    agg=allc.groupby('Term',as_index=False)['N'].sum()
+    agg['Survival']=agg['N']/denom if denom else np.nan
+    return agg
+
+
+def attention_lists(model: Dict[str, Any], include_directional: bool=False):
+    items=[]
+    for code in model['program_order']:
+        p=model['programs'][code]
+        n=safe_num(p.get('mature_n'))
+        if np.isnan(n) or n<=0:
+            continue
+        if n<THRESHOLDS['thin_sample_n'] and not include_directional:
+            continue
+        s=build_program_summary(model, code)
+        items.append((code,s))
+    attention=[x for x in items if x[1]['status']['word'] in {'Red','Amber'}]
+    attention.sort(key=lambda x:(0 if x[1]['status']['word']=='Red' else 1, -abs(safe_num(x[1]['fall_yoy'],0))))
+    out=[x for x in items if x[1]['status']['word']=='Green']
+    out.sort(key=lambda x: sum(v for v in [safe_num(x[1]['fall_yoy'],0),safe_num(x[1]['new_yoy'],0),safe_num(x[1]['persistence_delta'],0)] if not np.isnan(v)), reverse=True)
+    return attention,out
+
+
+def render_program_signal(code: str, summary: Dict[str, Any], program: Dict[str, Any]) -> None:
+    word=summary['status']['word']
+    if word=='Red': cls='red'; icon='🔴'
+    elif word=='Amber': cls='amber'; icon='🟡'
+    elif word=='Green': cls='green'; icon='🟢'
+    else: cls='grey'; icon='⚪'
+    st.markdown(f"<span class='status-badge {cls}'>{icon} {summary['status']['status'].replace(icon+' ','') if icon in summary['status']['status'] else word}</span>", unsafe_allow_html=True)
+    if summary.get('directional'):
+        st.markdown("<span class='status-badge blue'>↗ Directional</span>", unsafe_allow_html=True)
+    st.caption("Rules: " + "; ".join(summary['status']['rules']))
+
+
+def page_portfolio(model: Dict[str, Any]) -> None:
+    st.markdown("<div class='atlas-hero'><div class='eyebrow'>41 online graduate programs · data through Fall 2026</div><h1>How well our graduate programs <em>keep students</em>, and what it is worth</h1><p>Retention from mature cohorts, current enrollment movement, lifetime revenue, and early warnings from newer cohorts — all read directly from the workbook.</p></div>", unsafe_allow_html=True)
+    ch=model['changing']
+    cards=[
+        ('Fall enrollment',fmt_num(ch.get('Enrolled — Fall (latest vs prior yr)',{}).get('current')),fmt_pct(ch.get('Enrolled — Fall (latest vs prior yr)',{}).get('pct')), '👥','blue',TOOLTIP_DEFS['Enrollment YoY']),
+        ('AY2025 enrollment',fmt_num(ch.get('Enrolled — full FY (2025 vs 2024)',{}).get('current')),fmt_pct(ch.get('Enrolled — full FY (2025 vs 2024)',{}).get('pct')),'◫','teal','AY2025 compares with AY2024 because AY2026 is partial.'),
+        ('New starts',fmt_num(ch.get('New starts — full FY (2025 vs 2024)',{}).get('current')),fmt_pct(ch.get('New starts — full FY (2025 vs 2024)',{}).get('pct')),'↗','purple','Full-year new starts: AY2025 versus AY2024.'),
+        ('Continuing',fmt_num(ch.get('Continuing — full FY (2025 vs 2024)',{}).get('current')),fmt_pct(ch.get('Continuing — full FY (2025 vs 2024)',{}).get('pct')),'↻','orange','Full-year continuing students: AY2025 versus AY2024.'),
+    ]
+    cols=st.columns(4)
+    for col,(lab,val,delta,icon,tone,help_text) in zip(cols,cards):
+        with col: metric_card(lab,val,delta,icon,tone,help_text)
+
+    st.markdown("<div class='section-title'><span>Portfolio survival</span><small>Share of mature-cohort Term 1 students still enrolled</small></div>", unsafe_allow_html=True)
+    c1,c2=st.columns([1.55,1])
+    with c1:
+        surv=portfolio_survival_df(model, include_directional=False)
+        st.plotly_chart(plot_survival(surv.rename(columns={'N':'N'}),'Portfolio mature-cohort survival'), use_container_width=True)
+    with c2:
+        metric_card('Mature T1 base',fmt_num(model.get('portfolio_t1')),'','👥','teal','Student-weighted mature-cohort base across modeled programs.')
+        metric_card('New retention',fmt_pct(model.get('portfolio_new_retention')),'','↘','purple',TOOLTIP_DEFS['New retention'])
+        pdelta=persistence_delta(model)
+        metric_card('Persistence change',fmt_pp(pdelta),'','Δ','orange',TOOLTIP_DEFS['Persistence Δ'])
+        terms=model['terms_by_year'].get(2026,np.nan)
+        st.info(f"Persistence definition: {TOOLTIP_DEFS['Persistence Δ']} FY2026 currently has {fmt_num(terms)} observed terms. Continuing % is immature and is not used to set status.")
+
+    attention,out=attention_lists(model,False)
+    c1,c2=st.columns(2)
+    with c1:
+        st.markdown("<div class='section-title'><span>What needs attention</span><small>Largest decision-relevant deterioration</small></div>",unsafe_allow_html=True)
+        if not attention: st.success('No red or amber programs under the current rules.')
+        for code,s in attention[:6]:
+            p=model['programs'][code]
+            icon='🔴' if s['status']['word']=='Red' else '🟡'
+            st.markdown(f"<div class='signal-card'><div><b>{icon} {code} — {p['name']}</b><div class='small'>{s['primary']}</div><div class='small'>{s['secondary']}</div></div><div class='signal-value'>{fmt_pct(s['fall_yoy']) if not np.isnan(s['fall_yoy']) else 'Not available'}<span>Fall YoY</span></div></div>",unsafe_allow_html=True)
+    with c2:
+        st.markdown("<div class='section-title'><span>Outperforming</span><small>Strongest positive signals</small></div>",unsafe_allow_html=True)
+        if not out: st.info('No green programs with enough directional evidence to rank.')
+        for code,s in out[:6]:
+            p=model['programs'][code]
+            detail=[]
+            if not np.isnan(s['fall_yoy']): detail.append(f"Fall {fmt_pct(s['fall_yoy'])} YoY")
+            if not np.isnan(s['new_yoy']): detail.append(f"new starts {fmt_pct(s['new_yoy'])} YoY")
+            if not np.isnan(s['persistence_delta']): detail.append(f"persistence {fmt_pp(s['persistence_delta'])}")
+            st.markdown(f"<div class='signal-card'><div><b>🟢 {code} — {p['name']}</b><div class='small'>{' · '.join(detail) if detail else 'Positive portfolio signal'}</div></div></div>",unsafe_allow_html=True)
+
+    st.markdown("<div class='section-title'><span>Enrollment bridge</span><small>Exits are not split into graduation and withdrawal; the workbook supports new-start and continuing changes only</small></div>",unsafe_allow_html=True)
+    prior=safe_num(ch.get('Enrolled — full FY (2025 vs 2024)',{}).get('prior'))
+    current=safe_num(ch.get('Enrolled — full FY (2025 vs 2024)',{}).get('current'))
+    dn=safe_num(ch.get('New starts — full FY (2025 vs 2024)',{}).get('delta'))
+    dc=safe_num(ch.get('Continuing — full FY (2025 vs 2024)',{}).get('delta'))
+    if not any(np.isnan(x) for x in [prior,current,dn,dc]):
+        fig=go.Figure(go.Waterfall(x=['Prior AY total','New-start change','Continuing change','Current AY total'],y=[prior,dn,dc,current],measure=['absolute','relative','relative','total'],connector={'line':{'color':'#CBD5E1'}},increasing={'marker':{'color':BRAND['teal']},'textfont':{'color':BRAND['teal']}},decreasing={'marker':{'color':BRAND['red']},'textfont':{'color':BRAND['red']}},totals={'marker':{'color':BRAND['blue']}}))
+        fig.update_yaxes(title='Students')
+        st.plotly_chart(make_chart_template(fig),use_container_width=True)
+        st.caption('Definition: prior total → change in new starts → change in continuing students → current total. Exits always mean graduated OR withdrew combined.')
+
+    st.markdown("<div class='section-title'><span>Portfolio movement</span><small>Fall 2025 → Fall 2026</small></div>",unsafe_allow_html=True)
+    trend=[]
+    h=model['hc_term']
+    for code in model['program_order']:
+        a=h.loc[(h.code==code)&(h.term==202510),'headcount']; b=h.loc[(h.code==code)&(h.term==202610),'headcount']
+        if a.empty or b.empty: continue
+        av,bv=safe_num(a.iloc[0]),safe_num(b.iloc[0])
+        if np.isnan(av) or np.isnan(bv) or av==0: continue
+        trend.append({'Code':code,'Program':model['programs'][code]['name'],'Fall 2025':av,'Fall 2026':bv,'YoY %':bv/av-1})
+    tdf=pd.DataFrame(trend)
+    if not tdf.empty:
+        tdf['Movement']=np.where(tdf['YoY %']>0.005,'Growing',np.where(tdf['YoY %']<-0.005,'Shrinking','Stable'))
+        fig=px.bar(tdf.sort_values('YoY %'),x='YoY %',y='Program',orientation='h',color='Movement',color_discrete_map={'Growing':BRAND['teal'],'Stable':BRAND['amber'],'Shrinking':BRAND['red']},hover_data=['Code','Fall 2025','Fall 2026'])
+        fig.update_xaxes(tickformat='.0%')
+        st.plotly_chart(make_chart_template(fig),use_container_width=True)
+
+
+def page_program_v4(model: Dict[str, Any]) -> None:
+    st.markdown("<div class='page-kicker'>PROGRAM DEEP DIVE</div>",unsafe_allow_html=True)
+    query=st.text_input('Find a program',placeholder='Search code or program name…',label_visibility='collapsed')
+    codes=model['program_order']
+    if query:
+        q=query.lower(); codes=[c for c in codes if q in c.lower() or q in model['programs'][c]['name'].lower()]
+    if not codes: st.info('No programs match that search.'); return
+    selected=st.selectbox('Program',codes,format_func=lambda x:f'{x} — {model["programs"][x]["name"]}')
+    p=model['programs'][selected]; s=build_program_summary(model,selected)
+    st.markdown(f"# {selected} — {p['name']}")
+    if s['status']['word']=='Insufficient historical data':
+        st.markdown("<span class='status-badge grey'>⚪ Insufficient historical data</span>",unsafe_allow_html=True)
+        st.markdown("### What we know")
+        known=[]
+        rev=safe_num(p.get('revenue_data',{}).get('revenue')); starts=safe_num(p.get('revenue_data',{}).get('new_starts')); degree=safe_num(p.get('degree_ch'))
+        if not np.isnan(rev): known.append(f"Revenue: **{fmt_currency(rev)}**")
+        if not np.isnan(starts): known.append(f"Modeled new starts: **{fmt_num(starts)}**")
+        if not np.isnan(degree): known.append(f"Degree credit hours: **{fmt_num(degree)}**")
+        for x in known or ['Program exists in the workbook, but mature-cohort persistence is not available.']: st.markdown(f'- {x}')
+        st.markdown('### What we do not know yet')
+        for x in ['Mature-cohort persistence','Decision-grade LTR/student','Reliable LTR:CAC status']: st.markdown(f'- {x}')
+        st.markdown('### What this means')
+        st.write(program_three_sentence_summary(model,selected)); return
+    render_program_signal(selected,s,p)
+    st.markdown('<div class="score-grid">',unsafe_allow_html=True)
+    cols=st.columns(6)
+    metrics=[('Enrollment YoY',fmt_pct(s['fall_yoy']),'blue',TOOLTIP_DEFS['Enrollment YoY']),('New Starts YoY',fmt_pct(s['new_yoy']),'teal','Like-for-like academic-year new-start change: AY2025 vs AY2024.'),('Persistence Δ',fmt_pp(s['persistence_delta']),'purple',TOOLTIP_DEFS['Persistence Δ']),('LTR / student',fmt_currency(s['ltr_student']),'orange',TOOLTIP_DEFS['LTR/student']),('CAC',fmt_currency(s['cac']),'red',TOOLTIP_DEFS['CAC']),('LTR:CAC',f"{s['ltr_cac']:.1f}x" if not np.isnan(s['ltr_cac']) else 'Not available','green','Gross LTR/student divided by directional CAC.')]
+    for c,(lab,val,tone,help_text) in zip(cols,metrics):
+        with c: metric_card(lab,val,'','',tone,help_text)
+    st.markdown('</div>',unsafe_allow_html=True)
+    c1,c2=st.columns(2)
+    with c1:
+        st.markdown('### Primary issue'); st.markdown(f"<div class='issue-box'>{s['primary']}</div>",unsafe_allow_html=True)
+    with c2:
+        st.markdown('### Secondary issue'); st.markdown(f"<div class='issue-box'>{s['secondary']}</div>",unsafe_allow_html=True)
+    st.markdown(f"### Financial exposure · {fmt_currency(s['exposure']) if not np.isnan(s['exposure']) else 'Not available'}")
+    st.caption('Modeled gross-revenue exposure from the workbook; not a realized-loss forecast.')
+    c1,c2=st.columns(2)
+    with c1: st.plotly_chart(plot_survival(survival_curve(model,selected),f'{selected} — survival curve'),use_container_width=True)
+    with c2:
+        h=model['hc_term']; h=h[h.code==selected].copy()
+        if not h.empty:
+            h['Term']=h.term.map(term_label)
+            fig=px.line(h,x='Term',y='headcount',markers=True,title='Enrollment trajectory')
+            fig.update_traces(line_color=BRAND['purple'],hovertemplate='%{x}<br>Enrollment %{y:,.0f}<extra></extra>')
+            st.plotly_chart(make_chart_template(fig),use_container_width=True)
+    st.markdown('### 10-second read')
+    st.markdown(f"<div class='summary-box'>{program_three_sentence_summary(model,selected)}</div>",unsafe_allow_html=True)
+    # Methodology / tracker facts.
+    c1,c2,c3=st.columns(3)
+    with c1: metric_card('Mature N @ T1',fmt_num(p.get('mature_n')),'','👥','blue','Mature cohort Term 1 headcount.')
+    with c2: metric_card('New retention',fmt_pct(p.get('new_retention')),'','↘','teal',TOOLTIP_DEFS['New retention'])
+    with c3: metric_card('Returning retention',fmt_pct(p.get('returning_retention')),'','↻','purple','Retention from the workbook after the T3 anchor.')
+    st.markdown('### Tracker context')
+    tracker=p.get('tracker',{})
+    bench=safe_num(tracker.get('benchmark',{}).get('t1_t3'))
+    cohorts=tracker.get('cohorts',[])
+    if not np.isnan(bench):
+        vals=[safe_num(x.get('t1_t3')) for x in cohorts if not np.isnan(safe_num(x.get('t1_t3')))]
+        current=float(np.nanmean(vals)) if vals else np.nan
+        td=pd.DataFrame([{'Measure':'Current-year tracker T1→T3','Value':fmt_pct(current)},{'Measure':'Mature benchmark T1→T3','Value':fmt_pct(bench)},{'Measure':'Difference','Value':fmt_pp(current-bench if not np.isnan(current) else np.nan)}])
+        st.dataframe(td,use_container_width=True,hide_index=True)
+    else: st.info('No current-year tracker benchmark is available for this program.')
+
+
+def page_compare(model: Dict[str, Any]) -> None:
+    st.markdown("<div class='page-kicker'>COMPARE MODE</div>",unsafe_allow_html=True)
+    st.markdown('# Side by side')
+    st.caption('Pick two or three programs. Survival curves share one scale so differences are immediately visible.')
+    choices=model['program_order']
+    selected=st.multiselect('Programs',choices,default=choices[:2],max_selections=3,format_func=lambda x:f'{x} — {model["programs"][x]["name"]}')
+    if not selected: st.info('Choose at least two programs.'); return
+    fig=go.Figure()
+    for i,code in enumerate(selected):
+        df=survival_curve(model,code)
+        if df.empty: continue
+        fig.add_trace(go.Scatter(x=df.Term,y=df.Survival*100,mode='lines+markers',name=code,line=dict(color=PALETTE[i%len(PALETTE)],width=3),customdata=np.column_stack([df.N]),hovertemplate=f'{code}<br>T%{{x}}<br>Survival %{{y:.1f}}%<br>N %{{customdata[0]:,.0f}}<extra></extra>'))
+    fig.update_yaxes(title='Students remaining (%)',range=[0,105]); fig.update_xaxes(title='Relative term')
+    st.plotly_chart(make_chart_template(fig),use_container_width=True)
+    rows=[]
+    for code in selected:
+        p=model['programs'][code]; s=build_program_summary(model,code)
+        rows.append({'Code':code,'Program':p['name'],'Status':s['status']['status'],'N@T1':fmt_num(p.get('mature_n')),'New retention':fmt_pct(p.get('new_retention')),'Returning retention':fmt_pct(p.get('returning_retention')),'LTR/student':fmt_currency(s['ltr_student']),'CAC':fmt_currency(s['cac']),'LTR:CAC':f"{s['ltr_cac']:.1f}x" if not np.isnan(s['ltr_cac']) else 'Not available'})
+    st.dataframe(pd.DataFrame(rows),use_container_width=True,hide_index=True)
+
+
+def page_economics_v4(model: Dict[str, Any]) -> None:
+    render_header('Economics','Core revenue outputs first. Trial acquisition and margin metrics are clearly separated.')
+    rows=[]
+    for code in model['program_order']:
+        p=model['programs'][code]; r=p.get('revenue_data',{})
+        if not np.isnan(safe_num(r.get('revenue'))) or not np.isnan(safe_num(r.get('ltr'))): rows.append({'Code':code,'Program':p['name'],'Revenue':safe_num(r.get('revenue')),'LTR':safe_num(r.get('ltr')),'Revenue loss':safe_num(r.get('revenue_loss'))})
+    rdf=pd.DataFrame(rows)
+    if not rdf.empty:
+        st.markdown('### Revenue outlook')
+        long=rdf.melt(id_vars=['Code','Program'],value_vars=['Revenue','LTR'],var_name='Metric',value_name='Amount')
+        fig=px.bar(long.sort_values('Amount',ascending=False),x='Program',y='Amount',color='Metric',color_discrete_map={'Revenue':BRAND['blue'],'LTR':BRAND['teal']})
+        fig.update_xaxes(tickangle=-55); fig.update_yaxes(title='Dollars')
+        fig.update_traces(hovertemplate='%{x}<br>%{fullData.name}: $%{y:,.0f}<extra></extra>')
+        st.plotly_chart(make_chart_template(fig),use_container_width=True)
+    st.markdown('<div class="trial-banner"><b>TRIAL — approximate</b> CAC and margin metrics below are not Finance-approved.</div>',unsafe_allow_html=True)
+    cdf=[]
+    for code,d in model['cac'].items():
+        cac=safe_num(d.get('cac')); ltr=safe_num(d.get('ltr_student'))
+        if np.isnan(cac) or np.isnan(ltr): continue
+        cdf.append({'Code':code,'Program':model['programs'].get(code,{}).get('name',code),'CAC':cac,'LTR/student':ltr,'Quadrant':d.get('quadrant','Not available')})
+    cdf=pd.DataFrame(cdf)
+    if not cdf.empty:
+        st.markdown('### LTR vs acquisition cost')
+        fig=px.scatter(cdf,x='LTR/student',y='CAC',color='Quadrant',text='Code',color_discrete_sequence=PALETTE,hover_data=['Program'])
+        fig.update_traces(textposition='top center',marker=dict(size=14)); st.plotly_chart(make_chart_template(fig),use_container_width=True)
+        st.caption('CAC = FY26 paid-media acquisition cost per gross new start from the trial dataset. LTR:CAC is not a margin benchmark.')
+    mrows=[]
+    for code,d in model['margin'].items():
+        v=safe_num(d.get('margin_ltr_student'))
+        if np.isnan(v): continue
+        mrows.append({'Code':code,'Program':model['programs'].get(code,{}).get('name',code),'Approx margin LTR/student':v,'Approx margin %':safe_num(d.get('margin_pct'))})
+    mdf=pd.DataFrame(mrows)
+    if not mdf.empty:
+        st.markdown('### Margin view')
+        fig=px.bar(mdf.sort_values('Approx margin LTR/student',ascending=False),x='Program',y='Approx margin LTR/student')
+        fig.update_xaxes(tickangle=-55); st.plotly_chart(make_chart_template(fig),use_container_width=True)
+    st.warning('TRIAL — approximate: margin uses a workbook cost-to-deliver proxy and should not be treated as an approved Finance margin measure.')
+
+
+def inject_css_v4() -> None:
+    st.markdown(f"""
+    <style>
+    .stApp {{ background: linear-gradient(180deg,#f8fbff 0%,#ffffff 38%,#f8fafc 100%); color:{BRAND['ink']}; }}
+    [data-testid="stHeader"] {{ background:rgba(255,255,255,.82); }}
+    [data-testid="stSidebar"] {{ background:linear-gradient(180deg,#0b1f3a 0%,#102d52 60%,#173b68 100%); }}
+    [data-testid="stSidebar"] * {{ color:#eef6ff !important; }}
+    .block-container {{ max-width:1450px; padding-top:2.1rem; padding-bottom:3rem; }}
+    .atlas-hero {{ border-radius:28px; padding:34px 38px; margin-bottom:22px; color:white; background:linear-gradient(120deg,#10233f 0%,#1859a9 58%,#6d3fd1 100%); box-shadow:0 18px 50px rgba(16,35,63,.20); position:relative; overflow:hidden; }}
+    .atlas-hero:after {{ content:''; position:absolute; width:340px; height:340px; right:-120px; top:-150px; border-radius:50%; background:rgba(255,255,255,.10); }}
+    .atlas-hero h1 {{ font-size:2.45rem; line-height:1.08; margin:.35rem 0 .8rem; max-width:920px; font-weight:800; letter-spacing:-.04em; }}
+    .atlas-hero h1 em {{ color:#9ff4df; font-style:normal; }}
+    .atlas-hero p {{ max-width:920px; color:#dbeafe; font-size:1.05rem; margin:0; }}
+    .eyebrow,.page-kicker {{ text-transform:uppercase; letter-spacing:.12em; font-size:.72rem; font-weight:800; opacity:.85; }}
+    .metric-card {{ background:rgba(255,255,255,.96); border:1px solid #e6edf5; border-radius:18px; padding:18px 18px 16px; min-height:122px; box-shadow:0 8px 24px rgba(15,23,42,.07); border-top:4px solid #3b82f6; margin-bottom:12px; }}
+    .metric-card.card-teal {{ border-top-color:#14b8a6; }} .metric-card.card-purple {{ border-top-color:#7c3aed; }} .metric-card.card-orange {{ border-top-color:#f97316; }} .metric-card.card-red {{ border-top-color:#ef4444; }} .metric-card.card-green {{ border-top-color:#10b981; }}
+    .metric-label {{ color:#64748b; font-size:.78rem; font-weight:700; }} .metric-value {{ font-size:2rem; font-weight:800; letter-spacing:-.04em; color:#10233f; margin-top:7px; }} .metric-delta {{ font-size:.78rem; font-weight:800; margin-top:4px; color:#64748b; }}
+    .section-title {{ display:flex; align-items:baseline; justify-content:space-between; margin:28px 0 10px; }} .section-title span {{ font-size:1.25rem; font-weight:800; color:#10233f; }} .section-title small {{ color:#64748b; font-size:.78rem; }}
+    .signal-card {{ display:flex; justify-content:space-between; gap:16px; padding:15px 16px; border:1px solid #e7edf4; background:white; border-radius:15px; margin:8px 0; box-shadow:0 5px 18px rgba(15,23,42,.05); }}
+    .signal-card b {{ color:#10233f; }} .small {{ color:#667085; font-size:.78rem; margin-top:4px; }} .signal-value {{ font-weight:800; color:#10233f; text-align:right; }} .signal-value span {{ display:block; color:#94a3b8; font-size:.65rem; font-weight:600; }}
+    .status-badge {{ display:inline-block; border-radius:999px; padding:6px 10px; font-size:.78rem; font-weight:800; margin-right:6px; border:1px solid transparent; }} .status-badge.red {{ background:#fee2e2;color:#991b1b;border-color:#fecaca; }} .status-badge.amber {{ background:#fef3c7;color:#92400e;border-color:#fde68a; }} .status-badge.green {{ background:#dcfce7;color:#166534;border-color:#bbf7d0; }} .status-badge.grey {{ background:#f1f5f9;color:#475569;border-color:#e2e8f0; }} .status-badge.blue {{ background:#dbeafe;color:#1d4ed8;border-color:#bfdbfe; }}
+    .issue-box,.summary-box {{ padding:15px 17px; border-radius:14px; background:#f8fafc; border:1px solid #e2e8f0; color:#334155; }}
+    .trial-banner {{ margin:24px 0 12px; padding:12px 15px; border-radius:12px; background:#fff7ed; border:1px solid #fed7aa; color:#9a3412; }}
+    .stDataFrame {{ border-radius:14px; overflow:hidden; }}
+    div[data-testid="stMetric"] {{ background:white; border-radius:15px; }}
+    button[kind="secondary"] {{ border-radius:10px; }}
+    </style>
+    """, unsafe_allow_html=True)
+
+
 def main() -> None:
-    st.set_page_config(page_title="Graduate Portfolio Intelligence", page_icon="📊", layout="wide", initial_sidebar_state="expanded")
-    inject_css()
-    path = str(Path(__file__).with_name("model.xlsx"))
-    model = load_model(path)
-    st.sidebar.markdown("# Graduate Portfolio Intelligence")
-    st.sidebar.caption("V3 · decision tool · model.xlsx source of truth")
-    pages = ["Executive", "Enrollment", "Persistence", "Programs", "Economics", "Scenario Lab", "Model QA"]
-    page = st.sidebar.radio("Navigate", pages, index=0)
-    st.sidebar.markdown("---")
-    st.sidebar.caption("Definitions")
-    st.sidebar.caption("Enrollment YoY uses like-for-like periods. Exits mean graduated OR withdrew combined. Thin samples are directional and excluded from rankings by default.")
-    if page == "Executive": page_executive(model)
-    elif page == "Enrollment": page_enrollment(model)
-    elif page == "Persistence": page_persistence(model)
-    elif page == "Programs": page_programs(model)
-    elif page == "Economics": page_economics(model)
-    elif page == "Scenario Lab": page_scenario(model)
-    elif page == "Model QA": page_qa(model)
+    st.set_page_config(page_title='Graduate Persistence Atlas', page_icon='✦', layout='wide', initial_sidebar_state='expanded')
+    inject_css_v4()
+    path=str(Path(__file__).with_name('model.xlsx'))
+    model=load_model(path)
+    st.sidebar.markdown("<div style='font-size:1.15rem;font-weight:800'>✦ Persistence Atlas</div><div style='font-size:.76rem;opacity:.75;margin-top:4px'>Graduate programs · live workbook</div>",unsafe_allow_html=True)
+    st.sidebar.markdown('---')
+    pages=['Portfolio','Program','Compare','Economics','Scenario Lab','Model QA']
+    page=st.sidebar.radio('Navigate',pages,index=0)
+    st.sidebar.markdown('---')
+    st.sidebar.caption('Source of truth: model.xlsx. “—”, n/a and No data are treated as missing. Trial economics are clearly labeled approximate.')
+    if page=='Portfolio': page_portfolio(model)
+    elif page=='Program': page_program_v4(model)
+    elif page=='Compare': page_compare(model)
+    elif page=='Economics': page_economics_v4(model)
+    elif page=='Scenario Lab': page_scenario(model)
+    elif page=='Model QA': page_qa(model)
 
-
-if __name__ == "__main__":
+if __name__=='__main__':
     main()
